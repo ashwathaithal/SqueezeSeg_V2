@@ -48,9 +48,9 @@ class SqueezeSeg(ModelSkeleton):
             self.lidar_input, 'conv1_skip', 'bias', 'scale',
             filters=64, size=1, stride=1, padding='SAME', freeze=False,
             conv_with_bias=True, stddev=0.001)
+
     pool1 = self._pooling_layer(
         'pool1', self.conv1, size=3, stride=2, padding='SAME')
-
     fire2 = self._fire_layer(
         'fire2', pool1, s1x1=16, e1x1=64, e3x3=64, freeze=False)
     self.fire3 = self._fire_layer(
@@ -90,31 +90,19 @@ class SqueezeSeg(ModelSkeleton):
     fire12 = self._fire_deconv(
         'fire_deconv12', fire11_fuse, s1x1=16, e1x1=32, e3x3=32, factors=[1, 2],
         stddev=0.1)
-    fire12_fuse = tf.add(fire12, self.conv1, name='fire12_fuse')
-
+    self.fire12_fuse = tf.add(fire12, self.conv1, name='fire12_fuse')
+  
+  def _add_forward_graph_3(self):
+    mc = self.mc
     fire13 = self._fire_deconv(
-        'fire_deconv13', fire12_fuse, s1x1=16, e1x1=32, e3x3=32, factors=[1, 2],
+        'fire_deconv13', self.fire12_fuse, s1x1=16, e1x1=32, e3x3=32, factors=[1, 2],
         stddev=0.1)
     fire13_fuse = tf.add(fire13, self.conv1_skip, name='fire13_fuse')
 
-    self.drop13 = tf.nn.dropout(fire13_fuse, self.keep_prob, name='drop13')
-
-  def _add_forward_graph_3(self):
-    mc = self.mc
-    conv14 = self._conv_layer(
-        'conv14_prob', self.drop13, filters=mc.NUM_CLASS, size=3, stride=1,
-        padding='SAME', relu=False, stddev=0.1, init=True)
-
-    bilateral_filter_weights = self._bilateral_filter_layer(
-        'bilateral_filter', self.lidar_input[:, :, :, :3], # x, y, z
-        thetas=[mc.BILATERAL_THETA_A, mc.BILATERAL_THETA_R],
-        sizes=[mc.LCN_HEIGHT, mc.LCN_WIDTH], stride=1)
-
-    self.output_prob = self._recurrent_crf_layer(
-        'recurrent_crf', conv14, bilateral_filter_weights, 
-        sizes=[mc.LCN_HEIGHT, mc.LCN_WIDTH], num_iterations=mc.RCRF_ITER,
-        padding='SAME'
-    )
+    drop13 = tf.nn.dropout(fire13_fuse, self.keep_prob, name='drop13')
+    self.output_prob = conv14 = self._conv_layer(
+        'conv14_prob', drop13, filters=mc.NUM_BIN * 2, size=3, stride=1,
+        padding='SAME', relu=False, stddev=0.1)
 
   def _fire_layer(self, layer_name, inputs, s1x1, e1x1, e3x3, stddev=0.001,
       freeze=False):

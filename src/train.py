@@ -22,6 +22,8 @@ from imdb import kitti
 from utils.util import *
 from nets import *
 
+import pdb
+
 FLAGS = tf.app.flags.FLAGS
 
 tf.app.flags.DEFINE_string('dataset', 'KITTI',
@@ -40,11 +42,12 @@ tf.app.flags.DEFINE_string('pretrained_model_path', '',
                            """Path to the pretrained model.""")
 tf.app.flags.DEFINE_integer('summary_step', 50,
                             """Number of steps to save summary.""")
-tf.app.flags.DEFINE_integer('checkpoint_step', 1000,
+tf.app.flags.DEFINE_integer('checkpoint_step', 500,
                             """Number of steps to save summary.""")
 tf.app.flags.DEFINE_string('gpu', '0', """gpu id.""")
 
 def train():
+  #pdb.set_trace()
   """Train SqueezeSeg model"""
   assert FLAGS.dataset == 'KITTI', \
       'Currently only support KITTI dataset'
@@ -55,6 +58,7 @@ def train():
 
     assert FLAGS.net == 'squeezeSeg', \
         'Selected neural net architecture not supported: {}'.format(FLAGS.net)
+
 
     if FLAGS.net == 'squeezeSeg':
       mc = kitti_squeezeSeg_config()
@@ -93,26 +97,30 @@ def train():
       with coord.stop_on_exception():
         while not coord.should_stop():
           # read batch input
-          lidar_per_batch, lidar_mask_per_batch, label_per_batch,\
-              weight_per_batch = imdb.read_batch()
+          lidar_per_batch, lidar_mask_per_batch,\
+              intensity_per_batch,\
+              multiplier_per_batch, bin_per_batch, delta_per_batch = imdb.read_batch()
 
           feed_dict = {
               model.ph_keep_prob: mc.KEEP_PROB,
               model.ph_lidar_input: lidar_per_batch,
               model.ph_lidar_mask: lidar_mask_per_batch,
-              model.ph_label: label_per_batch,
-              model.ph_loss_weight: weight_per_batch,
+              model.ph_intensity: intensity_per_batch,
+              model.ph_multiplier: multiplier_per_batch,
+              model.ph_bin: bin_per_batch,
+              model.ph_delta: delta_per_batch
           }
 
           sess.run(model.enqueue_op, feed_dict=feed_dict)
-
+   
     saver = tf.train.Saver(tf.all_variables(), max_to_keep=10000)
     summary_op = tf.summary.merge_all()
     init = tf.initialize_all_variables()
 
     sess = tf.Session(config=tf.ConfigProto(allow_soft_placement=True))
     sess.run(init)
-
+    #saver.restore(sess, tf.train.latest_checkpoint('./log/trainV1/')) 
+    
     summary_writer = tf.summary.FileWriter(FLAGS.train_dir, sess.graph)
 
     coord = tf.train.Coordinator()
@@ -123,42 +131,46 @@ def train():
       enq_threads.append(eqth)
 
     run_options = tf.RunOptions(timeout_in_ms=60000)
-
     try:
       for step in xrange(FLAGS.max_steps):
         start_time = time.time()
 
         if step % FLAGS.summary_step == 0 or step == FLAGS.max_steps-1:
           op_list = [
-              model.lidar_input, model.lidar_mask, model.label, model.train_op,
-              model.loss, model.cls_loss, model.pred_cls, summary_op
+              model.lidar_input, model.lidar_mask, model.intensity,\
+               model.multiplier, model.bin, model.delta, model.train_op,\
+              model.loss, model.bin_loss, model.delta_loss, model.pred_R, model.pred_intensity, model.pred_bin,\
+              model.pred_delta, summary_op
           ]
 
-          lidar_per_batch, lidar_mask_per_batch, label_per_batch, \
-              _, loss_value, cls_loss_value, pred_cls, summary_str = sess.run(op_list,
-                                                              options=run_options)
+          lidar_per_batch, lidar_mask_per_batch, \
+              intensity_per_batch, multiplier_per_batch,\
+              bin_per_batch, delta_per_batch,\
+              _, loss_value, bin_loss_value, delta_loss_value, pred_R, pred_intensity, pred_bin, \
+              pred_delta, summary_str = sess.run(op_list)
 
-          label_image = visualize_seg(label_per_batch[:6, :, :], mc)
-          pred_image = visualize_seg(pred_cls[:6, :, :], mc)
+          #ground_truth_intensity, pred_intensity, 
+          label_image = intensity_per_batch[:6, :, :]
+          label_image = label_image[:, :, :, np.newaxis]
+          pred_image = pred_intensity[:6, :, :]
+          pred_image = pred_image[:, :, :, np.newaxis]
 
-          # Run evaluation on the batch
-          ious, _, _, _ = evaluate_iou(
-              label_per_batch, pred_cls*np.squeeze(lidar_mask_per_batch),
-              mc.NUM_CLASS)
+          se, sam_num = evaluate_se(intensity_per_batch, pred_intensity \
+              * np.squeeze(lidar_mask_per_batch))
+
+          sam_num_mask = lidar_mask_per_batch.size
 
           feed_dict = {}
-          # Assume that class-0 is the background class
-          for i in range(1, mc.NUM_CLASS):
-            feed_dict[model.iou_summary_placeholders[i]] = ious[i]
+          feed_dict[model.mse_summary_placeholders[0]] = np.log(se/sam_num_mask)
 
-          iou_summary_list = sess.run(model.iou_summary_ops[1:], feed_dict)
+          mse_summary_list = sess.run(model.mse_summary_ops[0], feed_dict)
 
           # Run visualization
           viz_op_list = [model.show_label, model.show_depth_img, model.show_pred]
           viz_summary_list = sess.run(
               viz_op_list, 
               feed_dict={
-                  model.depth_image_to_show: lidar_per_batch[:6, :, :, [4]],
+                  model.depth_image_to_show: lidar_per_batch[:6, :, :, [3]],
                   model.label_to_show: label_image,
                   model.pred_image_to_show: pred_image,
               }
@@ -167,8 +179,7 @@ def train():
           # Add summaries
           summary_writer.add_summary(summary_str, step)
 
-          for sum_str in iou_summary_list:
-            summary_writer.add_summary(sum_str, step)
+          summary_writer.add_summary(mse_summary_list, step)
 
           for viz_sum in viz_summary_list:
             summary_writer.add_summary(viz_sum, step)
@@ -177,8 +188,8 @@ def train():
           summary_writer.flush()
 
         else:
-          _, loss_value, cls_loss_value = sess.run(
-              [model.train_op, model.loss, model.cls_loss], options=run_options)
+          _, loss_value, bin_loss_value, delta_loss_value = sess.run(
+              [model.train_op, model.loss, model.bin_loss, model.delta_loss])
 
         duration = time.time() - start_time
 
@@ -191,9 +202,9 @@ def train():
           num_images_per_step = mc.BATCH_SIZE
           images_per_sec = num_images_per_step / duration
           sec_per_batch = float(duration)
-          format_str = ('%s: step %d, loss = %.2f, cls_loss = %.2f (%.1f images/sec; %.3f '
+          format_str = ('%s: step %d, loss = %.4f, bin_loss = %.4f, delta_loss = %.4f (%.1f images/sec; %.3f '
                         'sec/batch)')
-          print (format_str % (datetime.now(), step, loss_value, cls_loss_value, 
+          print (format_str % (datetime.now(), step, loss_value, bin_loss_value, delta_loss_value,
                                images_per_sec, sec_per_batch))
           sys.stdout.flush()
 

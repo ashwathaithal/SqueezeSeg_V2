@@ -13,8 +13,19 @@ class kitti(imdb):
     imdb.__init__(self, 'kitti_'+image_set, mc)
     self._image_set = image_set
     self._data_root_path = data_path
-    self._lidar_2d_path = os.path.join(self._data_root_path, 'lidar_2d_original')
 
+    self._lidar_2d_path = os.path.join(self._data_root_path, 'lidar_2d')
+    self._gta_2d_path = os.path.join('/rscratch18/schzhao/SqueezeSeg/data', 'gtav_predicted')
+    
+    self._lidar_R_path = os.path.join(self._data_root_path, 'lidar_R')
+    self._gta_R_path = os.path.join(self._data_root_path, 'gtav_R')
+  
+    self._lidar_multiplier_path = os.path.join(self._data_root_path, 'lidar_multiplier')
+    self._gta_multiplier_path = os.path.join(self._data_root_path, 'gtav_multiplier')
+
+    self._lidar_mask_path = os.path.join(self._data_root_path, 'lidar_mask')
+    self._gta_mask_path = os.path.join(self._data_root_path, 'gtav_mask')
+    
     # a list of string indices of images in the directory
     self._image_idx = self._load_image_set_idx() 
     # a dict of image_idx -> [[cx, cy, w, h, cls_idx]]. x,y,w,h are not divided by
@@ -31,17 +42,36 @@ class kitti(imdb):
         self._data_root_path, 'ImageSet', self._image_set+'.txt')
     assert os.path.exists(image_set_file), \
         'File does not exist: {}'.format(image_set_file)
-
     with open(image_set_file) as f:
       image_idx = [x.strip() for x in f.readlines()]
     return image_idx
 
-  def _lidar_2d_path_at(self, idx):
-    if idx[:4] == 'gta_':
+  def _lidar_2d_path_at(self, idx, gta = False):
+    if gta:
       lidar_2d_path = os.path.join(self._gta_2d_path, idx+'.npy')
     else:
       lidar_2d_path = os.path.join(self._lidar_2d_path, idx+'.npy')
-
     assert os.path.exists(lidar_2d_path), \
         'File does not exist: {}'.format(lidar_2d_path)
     return lidar_2d_path
+
+  def _R_path_at(self, idx, gta = False):
+    if gta:
+      R_path = os.path.join(self._gta_R_path, idx+'.npy')
+    else:
+      R_path = os.path.join(self._lidar_R_path, idx+'.npy')
+    return R_path
+
+  def _multiplier_path_at(self, idx, gta = False):
+    if gta:
+      multiplier_path = os.path.join(self._gta_multiplier_path, idx+'.npy')
+    else:
+      multiplier_path = os.path.join(self._lidar_multiplier_path, idx+'.npy')
+    return multiplier_path
+
+  def _mask_path_at(self, idx, gta = False):
+    if gta:
+      mask_path = os.path.join(self._gta_mask_path, idx+'.npy')
+    else:
+      mask_path = os.path.join(self._lidar_mask_path, idx+'.npy')
+    return mask_path

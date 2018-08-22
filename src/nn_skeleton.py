@@ -14,6 +14,7 @@ import numpy as np
 import tensorflow as tf
 
 
+
 def _variable_on_device(name, shape, initializer, trainable=True):
   """Helper to create a Variable.
 
@@ -65,7 +66,7 @@ class ModelSkeleton:
     self.ph_keep_prob = tf.placeholder(tf.float32, name='keep_prob')
     # projected lidar points on a 2D spherical surface
     self.ph_lidar_input = tf.placeholder(
-        tf.float32, [mc.BATCH_SIZE, mc.ZENITH_LEVEL, mc.AZIMUTH_LEVEL, 5],
+        tf.float32, [mc.BATCH_SIZE, mc.ZENITH_LEVEL, mc.AZIMUTH_LEVEL, 4],
         name='lidar_input'
     )
     # A tensor where an element is 1 if the corresponding cell contains an
@@ -73,32 +74,40 @@ class ModelSkeleton:
     self.ph_lidar_mask = tf.placeholder(
         tf.float32, [mc.BATCH_SIZE, mc.ZENITH_LEVEL, mc.AZIMUTH_LEVEL, 1],
         name='lidar_mask')
-    # A tensor where each element contains the class of each pixel
-    self.ph_label = tf.placeholder(
-        tf.int32, [mc.BATCH_SIZE, mc.ZENITH_LEVEL, mc.AZIMUTH_LEVEL],
-        name='label')
-    # weighted loss for different classes
-    self.ph_loss_weight = tf.placeholder(
+    self.ph_intensity = tf.placeholder(
         tf.float32, [mc.BATCH_SIZE, mc.ZENITH_LEVEL, mc.AZIMUTH_LEVEL],
-        name='loss_weight')
+        name = 'intensity')
+    self.ph_multiplier = tf.placeholder(
+        tf.float32, [mc.BATCH_SIZE, mc.ZENITH_LEVEL, mc.AZIMUTH_LEVEL],
+        name = 'multiplier')
+    # A tensor where each element contains the bin of each pixel
+    self.ph_bin = tf.placeholder(
+        tf.float32, [mc.BATCH_SIZE, mc.ZENITH_LEVEL, mc.AZIMUTH_LEVEL, mc.NUM_BIN],
+        name='bin')
+    self.ph_delta = tf.placeholder(
+        tf.float32, [mc.BATCH_SIZE, mc.ZENITH_LEVEL, mc.AZIMUTH_LEVEL, mc.NUM_BIN],
+        name='delta')
 
     # define a FIFOqueue for pre-fetching data
     self.q = tf.FIFOQueue(
         capacity=mc.QUEUE_CAPACITY,
-        dtypes=[tf.float32, tf.float32, tf.float32, tf.int32, tf.float32],
+        dtypes=[tf.float32, tf.float32, tf.float32, tf.float32, tf.float32, \
+                tf.float32, tf.float32],
         shapes=[[],
-                [mc.BATCH_SIZE, mc.ZENITH_LEVEL, mc.AZIMUTH_LEVEL, 5],
+                [mc.BATCH_SIZE, mc.ZENITH_LEVEL, mc.AZIMUTH_LEVEL, 4],
                 [mc.BATCH_SIZE, mc.ZENITH_LEVEL, mc.AZIMUTH_LEVEL, 1],
                 [mc.BATCH_SIZE, mc.ZENITH_LEVEL, mc.AZIMUTH_LEVEL],
-                [mc.BATCH_SIZE, mc.ZENITH_LEVEL, mc.AZIMUTH_LEVEL]]
+                [mc.BATCH_SIZE, mc.ZENITH_LEVEL, mc.AZIMUTH_LEVEL],
+                [mc.BATCH_SIZE, mc.ZENITH_LEVEL, mc.AZIMUTH_LEVEL, mc.NUM_BIN],
+                [mc.BATCH_SIZE, mc.ZENITH_LEVEL, mc.AZIMUTH_LEVEL, mc.NUM_BIN]]
     )
     self.enqueue_op = self.q.enqueue(
-        [self.ph_keep_prob, self.ph_lidar_input, self.ph_lidar_mask,
-          self.ph_label, self.ph_loss_weight]
+        [self.ph_keep_prob, self.ph_lidar_input, self.ph_lidar_mask, \
+        self.ph_intensity, self.ph_multiplier, self.ph_bin, self.ph_delta]
     )
 
-    self.keep_prob, self.lidar_input, self.lidar_mask, self.label, \
-        self.loss_weight = self.q.dequeue()
+    self.keep_prob, self.lidar_input, self.lidar_mask, self.intensity, self.multiplier,\
+     self.bin, self.delta = self.q.dequeue()
 
     # model parameters
     self.model_params = []
@@ -120,37 +129,52 @@ class ModelSkeleton:
     """Define how to intepret output."""
     mc = self.mc
     with tf.variable_scope('interpret_output') as scope:
-      self.prob = tf.multiply(
-          tf.nn.softmax(self.output_prob, dim=-1), self.lidar_mask,
-          name='pred_prob')
-      self.pred_cls = tf.argmax(self.prob, axis=3, name='pred_cls')
+      self.logits = self.output_prob[:, :, :, :mc.NUM_BIN] * tf.cast(self.lidar_mask, tf.float32)
+      self.pred_bin = tf.argmax(self.logits, axis=3, name = 'pred_bin')
+      self.pred_delta_raw = mc.BIN_INTERVALS * tf.sigmoid(self.output_prob[:, :, :, mc.NUM_BIN:])\
+                            - mc.BIN_INTERVALS/2
+      self.pred_R_raw = self.pred_delta_raw + mc.MID_VALUES
+      self.R_mask = tf.cast(tf.one_hot(self.pred_bin, mc.NUM_BIN), bool)
 
-      # add summaries
-      for cls_id, cls in enumerate(mc.CLASSES):
-        self._activation_summary(self.prob[:, :, :, cls_id], 'prob_'+cls)
+      self.pred_delta = tf.boolean_mask(self.pred_delta_raw, self.R_mask)
+      self.pred_delta = tf.reshape(self.pred_delta, tf.shape(self.pred_bin))
+      self.pred_delta = tf.multiply(self.pred_delta, tf.squeeze(self.lidar_mask))   
+
+      self.pred_R = tf.boolean_mask(self.pred_R_raw, self.R_mask)
+      self.pred_R = tf.reshape(self.pred_R, tf.shape(self.pred_bin))
+      self.pred_R = tf.multiply(self.pred_R, tf.squeeze(self.lidar_mask))
+      self.pred_intensity_raw = self.multiplier * self.pred_R
+      self.pred_intensity = tf.minimum(tf.constant(1.0), tf.maximum(self.pred_intensity_raw, 0.0))
+
+      self._activation_summary(self.pred_delta, 'pred_delta')
+      self._activation_summary(self.pred_R, 'pred_R')
+      self._activation_summary(self.pred_intensity, 'pred_intensity')
 
   def _add_loss_graph(self):
     """Define the loss operation."""
-    """Define the loss operation."""
     mc = self.mc
+    with tf.variable_scope('regression_loss') as scope:
+      self.bin_loss = tf.identity(\
+          tf.reduce_sum(\
+              ((1.-self.bin)*self.logits \
+               + (1.+(mc.BIN_LOSS_WEIGHT-1.)*self.bin) \
+                 * (tf.log(1.+tf.exp(-tf.abs(self.logits)))+tf.maximum(-self.logits, 0.))) \
+              * self.lidar_mask
+          ) / tf.reduce_sum(self.lidar_mask) / mc.NUM_BIN * mc.BIN_LOSS_COEF,
+          name='bin_loss'
+      )
 
-    with tf.variable_scope('cls_loss') as scope:
-      label = tf.reshape(self.label, (-1, )) #class labels
-      prob = tf.reshape(self.prob,(-1, mc.NUM_CLASS)) + mc.DENOM_EPSILON #output prob
-      onehot_labels = tf.one_hot(label, mc.NUM_CLASS)  #onehot class labels
-      cross_entropy = tf.multiply(onehot_labels, -tf.log(prob)) * \
-                      tf.reshape(self.loss_weight, (-1, 1)) * tf.reshape(self.lidar_mask, (-1, 1)) #cross entropy
-      weight = (1.0 - prob) ** mc.FOCAL_GAMMA #weight in the def of focal loss
-      fl = weight * cross_entropy #focal loss
-      self.cls_loss = tf.identity(tf.reduce_sum(fl) /   \
-                      tf.reduce_sum(self.lidar_mask) * mc.CLS_LOSS_COEF, name='cls_loss')
-      tf.add_to_collection('losses', self.cls_loss)
+      self.delta_loss = tf.identity(tf.reduce_sum(\
+          (self.pred_delta_raw - self.delta) ** 2 * self.bin * self.lidar_mask) \
+          / tf.reduce_sum(self.lidar_mask) * mc.DELTA_LOSS_COEF, name='delta_loss')
 
-    # add above losses as well as weight decay losses to form the total loss
+      tf.add_to_collection('losses', self.bin_loss + self.delta_loss)
+
+      # add above losses as well as weight decay losses to form the total loss
     self.loss = tf.add_n(tf.get_collection('losses'), name='total_loss')
-    # add loss summaries
-    # _add_loss_summaries(self.loss)
-    tf.summary.scalar(self.cls_loss.op.name, self.cls_loss)
+
+    tf.summary.scalar(self.bin_loss.op.name, self.bin_loss)
+    tf.summary.scalar(self.delta_loss.op.name, self.delta_loss)
     tf.summary.scalar(self.loss.op.name, self.loss)
 
   def _add_train_graph(self):
@@ -207,18 +231,17 @@ class ModelSkeleton:
     """Add extra summary operations."""
     mc = self.mc
 
-    iou_summary_placeholders = []
-    iou_summary_ops = []
+    mse_summary_placeholders = []
+    mse_summary_ops = []
 
-    for cls in mc.CLASSES:
-      ph = tf.placeholder(tf.float32, name=cls+'_iou')
-      iou_summary_placeholders.append(ph)
-      iou_summary_ops.append(
-          tf.summary.scalar('Eval/'+cls+'_iou', ph, collections='eval_summary')
-      )
+    ph = tf.placeholder(tf.float32, name='mse')
+    mse_summary_placeholders.append(ph)
+    mse_summary_ops.append(
+        tf.summary.scalar('Eval/mse', ph, collections='eval_summary')
+    )
 
-    self.iou_summary_placeholders = iou_summary_placeholders
-    self.iou_summary_ops = iou_summary_ops
+    self.mse_summary_placeholders = mse_summary_placeholders
+    self.mse_summary_ops = mse_summary_ops
 
   def _conv_bn_layer(
       self, inputs, conv_param_name, bn_param_name, scale_param_name, filters,
@@ -578,7 +601,7 @@ class ModelSkeleton:
   
   def _fc_layer(
       self, layer_name, inputs, hiddens, flatten=False, relu=True,
-      xavier=False, stddev=0.001, bias_init_val=0.0):
+      xavier=True, stddev=0.001, bias_init_val=0.0):
     """Fully connected layer operation constructor.
 
     Args:

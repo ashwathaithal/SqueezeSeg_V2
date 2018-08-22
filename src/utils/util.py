@@ -102,6 +102,28 @@ def evaluate_iou(label, pred, n_class, epsilon=1e-12):
 
   return ious, tps, fps, fns
 
+def evaluate_se(label, pred, epsilon=1e-12):
+  """Evaluation script to compute SE (squared error).
+
+  Args:
+    label: N-d array of shape [batch, W, H], where each element is an groundtruth intensity.
+    pred: N-d array of shape [batch, W, H], the each element is the predicted
+        intensity.
+    epsilon: a small value to prevent division by 0
+
+  Returns:
+    se: squared error.
+    sam_num: sample number.
+  """
+
+  assert label.shape == pred.shape, \
+      'label and pred shape mismatch: {} vs {}'.format(
+          label.shape, pred.shape)
+
+  se = np.sum((label - pred) ** 2)
+  sam_num = label.size
+  return se, sam_num
+
 def condensing_matrix(size_z, size_a, in_channel):
   assert size_z % 2 == 1 and size_a % 2==1, \
       'size_z and size_a should be odd number'

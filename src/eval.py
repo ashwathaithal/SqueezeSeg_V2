@@ -196,7 +196,7 @@ def evaluate():
     summary_writer = tf.summary.FileWriter(FLAGS.eval_dir, g)
     
     ckpts = set() 
-    for step in range(22000, 32000, 250):
+    for step in range(0, 32000, 100):
       ckpt_path = '/rscratch/xuanyu/SqueezeSeg_v2/log/train/model.ckpt-' + str(step)
       eval_once(
             saver, ckpt_path, summary_writer, eval_summary_ops,
